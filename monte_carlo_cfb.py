@@ -1,0 +1,1206 @@
+# monte_carlo_cfb.py
+import json, math, random
+import numpy as np
+import pandas as pd
+import joblib
+import xgboost as xgb
+from dataclasses import dataclass, field
+from typing import Dict, Tuple, List, Optional
+from tqdm import tqdm
+import re
+from functools import lru_cache
+
+
+# -----------------------------
+# clock constants
+# -----------------------------
+
+T_PASS_C   = 26  # completed pass
+T_PASS_INC = 10  # incompletion (clock stops)
+T_SACK     = 24
+T_RUN      = 28
+T_FG       = 12
+T_PUNT     = 16
+
+# -----------------------------
+# Utilities
+# -----------------------------
+RNG = np.random.default_rng()
+
+def _round1(x): return float(np.round(x, 1))
+
+def _pass_key(df: pd.DataFrame, with_target: bool) -> tuple:
+    r = df.iloc[0]
+    # coarse bins to boost cache hits (tune as you like)
+    dist_b = round(r['distance'] * 2) / 2.0          # 0.5-yd bins
+    ytg_b  = int(round(r['yardsToGoal']))            # 1-yd bins
+    sec_b  = int(r['seconds_remaining'] // 30)       # 30s bucket
+    key = (
+        int(r['down']), dist_b, ytg_b,
+        int(r['is_red_zone']), int(r['goal_to_go']),
+        int(r['fourth_and_short']), int(r['fg_range']),
+        int(r['half']), int(r['two_minute']),
+        int(r['offenseTimeouts']), int(r['defenseTimeouts']),
+        _round1(r['sp_rating_off']),
+        _round1(r['sp_offense_rating_off']),
+        _round1(r['sp_defense_rating_def']),
+        _round1(r['sp_rating_def']),
+        str(r['passer_name']),
+        str(r['target_name']) if with_target else "",
+        sec_b,
+    )
+    return key
+
+_PASS1_CACHE = {}
+_PASS2_CACHE = {}
+_PY_CACHE = {}   # pass yards quantiles
+_RY_CACHE = {}   # rush yards quantiles
+_SY_CACHE = {}   # sack loss quantiles
+
+
+def softclip(x, lo, hi): return max(lo, min(hi, x))
+
+def sample_categorical(labels: List[str], probs: List[float]) -> str:
+    probs = np.array(probs, dtype=float)
+    probs = probs / probs.sum()
+    return labels[RNG.choice(len(labels), p=probs)]
+
+def sec_in_half_left(seconds_remaining: int) -> int:
+    # seconds_remaining counts down from 3600; halves are 1800s blocks
+    return int(seconds_remaining % 1800)
+
+def red_zone(yards_to_goal: float) -> int:
+    return int(yards_to_goal <= 20)
+
+def goal_to_go(distance: float, yards_to_goal: float) -> int:
+    return int(distance >= (yards_to_goal - 0.5))
+
+def fourth_and_short(down: int, distance: float) -> int:
+    return int(down == 4 and distance <= 2.0)
+
+def fg_range(yards_to_goal: float) -> int:
+    # heuristic: within ~50 yard attempt
+    return int(yards_to_goal <= 33)
+
+def new_team_stats():
+    return dict(
+        plays=0,
+        pass_att=0, comp=0, pass_yds=0.0, pass_td=0, INT=0, sacks=0,
+        rush_att=0, rush_yds=0.0, rush_td=0,
+        FG=0, FGA=0, punts=0,
+        # NEW diagnostics
+        rz_trips=0, rz_TD=0,
+        fourth_go=0, fourth_conv=0,
+        points=0
+    )
+
+def _taper(y: float, t1: float = 22.0, t2: float = 42.0, r1: float = 0.60, r2: float = 0.40) -> float:
+    """
+    Piecewise linear taper:
+      <= t1: unchanged
+      t1..t2: slope r1
+      > t2:   slope r2
+    Tunables: t1/t2 (breakpoints), r1/r2 (post-break slopes).
+    """
+    if y <= t1:
+        return y
+    if y <= t2:
+        return t1 + (y - t1) * r1
+    return t1 + (t2 - t1) * r1 + (y - t2) * r2
+
+# --- Player stat helpers ---
+COUNT_SACK_AS_ATT = False  # NCAA-style: sacks are not pass attempts
+
+def _new_p_pass(): return dict(att=0, comp=0, yds=0.0, td=0, INT=0, sacks=0)
+def _new_p_rush(): return dict(att=0, yds=0.0, td=0)
+def _new_p_rec():  return dict(tgt=0, rec=0, yds=0.0, td=0)
+
+def _ensure_player(pstats, team, role, name):
+    """
+    pstats[team] = {'pass':{}, 'rush':{}, 'rec':{}}
+    role in {'pass','rush','rec'}
+    """
+    if team not in pstats:
+        pstats[team] = {'pass':{}, 'rush':{}, 'rec':{}}
+    if role not in pstats[team]:
+        pstats[team][role] = {}
+    if name not in pstats[team][role]:
+        if role == 'pass': pstats[team][role][name] = _new_p_pass()
+        elif role == 'rush': pstats[team][role][name] = _new_p_rush()
+        else: pstats[team][role][name] = _new_p_rec()
+
+
+
+
+# -----------------------------
+# SP+ loader (3 columns per team: RATING, OFFENSE, DEFENSE)
+# -----------------------------
+SP_PATH = "PregameSPPlus2022_2024_8.csv"
+_SP_CACHE = None
+
+def _load_sp(path: str = SP_PATH) -> pd.DataFrame:
+    global _SP_CACHE
+    if _SP_CACHE is None:
+        sp = pd.read_csv(path)
+        # normalize columns we need
+        keep = ['team','RATING','OFFENSE','DEFENSE','year','week','conference']
+        sp = sp[keep].copy()
+        sp['team'] = sp['team'].astype(str)
+        sp['year'] = sp['year'].astype(int)
+        sp['week'] = sp['week'].astype(int)
+        _SP_CACHE = sp
+    return _SP_CACHE
+
+def _lookup_sp(team: str, year: int, week: int) -> Tuple[float,float,float]:
+    """Return (RATING, OFFENSE, DEFENSE) for the latest entry at or before week."""
+    sp = _load_sp()
+    # case-insensitive match on team
+    df = sp[(sp['year'] == year) & (sp['team'].str.lower() == team.lower()) & (sp['week'] <= week)]
+    if df.empty:
+        # fallback: latest in that year
+        df = sp[(sp['year'] == year) & (sp['team'].str.lower() == team.lower())]
+        if df.empty:
+            raise ValueError(f"SP+ not found for team={team}, year={year}.")
+    row = df.sort_values('week').iloc[-1]
+    return float(row['RATING']), float(row['OFFENSE']), float(row['DEFENSE'])
+
+
+# -----------------------------
+# Team context & usage
+# -----------------------------
+@dataclass
+class TeamContext:
+    name: str
+    year: int
+    week: int
+    # raw SP+ (from PregameSPPlus…): three numbers per team
+    sp_rating: float         # overall RATING
+    sp_offense: float        # OFFENSE
+    sp_defense: float        # DEFENSE
+    # usage shares
+    qb_share: pd.DataFrame | None = None      # columns: passer_name, share
+    rush_share: pd.DataFrame | None = None    # columns: rusher_name, share
+    target_share: pd.DataFrame | None = None  # columns: receiver_name, share
+
+def matchup_bias(off: TeamContext, deff: TeamContext, k: float = 0.12) -> float:
+    # positive when offense > defense
+    return k * (off.sp_offense - deff.sp_defense) / 40.0
+
+def yardage_multiplier(off: TeamContext, deff: TeamContext, k: float = 0.10) -> float:
+    gap = (off.sp_offense - deff.sp_defense) / 30.0
+    return 1.0 + k * math.tanh(gap)
+
+
+def mismatch_z(off: TeamContext, deff: TeamContext) -> float:
+    # Rough standardized gap (40 ≈ big gap)
+    return (off.sp_offense - deff.sp_defense) / 40.0
+
+def rz_finish_prob_pass(ytg: float, off: TeamContext, deff: TeamContext, down: int) -> float:
+    # Base ~30% at 1st & Goal on the 7 → ~60% on the 1
+    base = 0.30 + 0.30 * (max(0.0, 7.0 - ytg) / 7.0)
+    base += 0.03 * max(0, 4 - down)           # more downs left ⇒ slightly higher
+    tilt = 0.07 * math.tanh((off.sp_offense - deff.sp_defense) / 35.0)
+    return float(softclip(base + tilt, 0.22, 0.68))
+
+
+def rz_finish_prob_run(ytg: float, off: TeamContext, deff: TeamContext, down: int) -> float:
+    # Base ~28% at 1st & Goal on the 7 → ~58% on the 1
+    base = 0.28 + 0.30 * (max(0.0, 7.0 - ytg) / 7.0)
+    base += 0.04 * max(0, 4 - down)
+    tilt = 0.06 * math.tanh((off.sp_offense - deff.sp_defense) / 35.0)
+    return float(softclip(base + tilt, 0.20, 0.62))
+
+
+
+
+
+def sack_scale(off: TeamContext, deff: TeamContext) -> float:
+    # <1.0 fewer sacks for strong O vs weak D; >1.0 the opposite
+    return float(softclip(math.exp(-1.0 * mismatch_z(off, deff)), 0.60, 1.50))
+
+def explosive_prob(off: TeamContext, deff: TeamContext, ytg: float) -> float:
+    # Small chance of an explosive when there’s space & mismatch
+    base = 0.03 + 0.05 * mismatch_z(off, deff)
+    if ytg > 60: base += 0.02
+    if ytg > 40: base += 0.01
+    return float(softclip(base, 0.01, 0.12))
+
+
+def redzone_finish_prob(off: TeamContext, deff: TeamContext, down: int, ytg: float):
+    # Base ~45% at 1st & Goal on the 5, trending up closer to goal line
+    base = 0.45 + 0.10 * max(0, 5 - ytg)   # 0.45..0.95 as ytg goes 5→0
+    # More shots left → higher
+    downs_left = max(0, 4 - down)
+    base += 0.05 * downs_left              # +0..0.15
+    # Team strength tilt
+    tilt = softclip((off.sp_offense - deff.sp_defense) / 40.0, -0.5, 0.5)
+    base += 0.10 * tilt
+    return float(softclip(base, 0.30, 0.95))
+
+
+def _load_usage_table(path: str, team: str, year: int,
+                      who_col: str, count_col: str = 'share') -> Optional[pd.DataFrame]:
+    try:
+        df = pd.read_csv(path)
+        df = df[(df['offense'] == team) & (df['year'] == year)].copy()
+        if df.empty: return None
+        col = who_col
+        if col not in df.columns:
+            return None
+        # normalize shares (defensive against rounding issues)
+        df = df[[col, 'share']].dropna()
+        if df.empty: return None
+        s = df['share'].clip(lower=0)
+        s = s / s.sum() if s.sum() > 0 else pd.Series([1.0], index=[0])
+        df['share'] = s.values
+        return df
+    except Exception:
+        return None
+
+def build_team_context(team: str, year: int, week: int) -> TeamContext:
+    rating, off, deff = _lookup_sp(team, year, week)
+    qb = _load_usage_table("usage_qb_share.csv", team, year, "passer_name")
+    ru = _load_usage_table("usage_rush_share.csv", team, year, "rusher_name")
+    tg = _load_usage_table("usage_target_share.csv", team, year, "receiver_name")
+    if qb is None: qb = pd.DataFrame({"passer_name": ["Unknown"], "share": [1.0]})
+    if ru is None: ru = pd.DataFrame({"rusher_name": ["Unknown"], "share": [1.0]})
+    if tg is None: tg = pd.DataFrame({"receiver_name": ["Unknown"], "share": [1.0]})
+    return TeamContext(
+        name=team, year=year, week=week,
+        sp_rating=rating, sp_offense=off, sp_defense=deff,
+        qb_share=qb, rush_share=ru, target_share=tg
+    )
+
+def sample_qb(tc: TeamContext) -> str:
+    df = tc.qb_share
+    return str(df.iloc[RNG.choice(len(df), p=df['share'].values)]['passer_name'])
+
+def sample_rusher(tc: TeamContext) -> str:
+    df = tc.rush_share
+    return str(df.iloc[RNG.choice(len(df), p=df['share'].values)]['rusher_name'])
+
+def sample_target(tc: TeamContext) -> str:
+    df = tc.target_share
+    return str(df.iloc[RNG.choice(len(df), p=df['share'].values)]['receiver_name'])
+
+# -----------------------------
+# Load models (once)
+# -----------------------------
+# Two-stage pass outcome
+PASS1 = xgb.Booster(); PASS1.load_model("pass_stage1_complete_vs_not.json")
+PASS1_META = joblib.load("pass_stage1_preprocessor.joblib")  # ColumnTransformer pipeline for stage1
+
+PASS2 = xgb.Booster(); PASS2.load_model("pass_stage2_notcomplete.json")
+PASS2_PRE = joblib.load("pass_stage2_preprocessor.joblib")
+PASS2_CLASSES = pd.read_csv("pass_stage2_classes.csv", header=None)[0].tolist()  # order used by model
+
+# Quantile pipelines
+PY10 = joblib.load("pass_yards_q10.joblib")
+PY50 = joblib.load("pass_yards_q50.joblib")
+PY90 = joblib.load("pass_yards_q90.joblib")
+
+RY10 = joblib.load("run_yards_q10.joblib")
+RY50 = joblib.load("run_yards_q50.joblib")
+RY90 = joblib.load("run_yards_q90.joblib")
+
+SY10 = joblib.load("sack_yards_q10.joblib")
+SY50 = joblib.load("sack_yards_q50.joblib")
+SY90 = joblib.load("sack_yards_q90.joblib")
+
+# -----------------------------
+# Policy (play call) – simple v1 heuristic
+# -----------------------------
+# -----------------------------
+# Outcome models wrappers
+# -----------------------------
+ST1_FEATURES = [
+    'down','distance','yardsToGoal','is_red_zone','score_diff','seconds_remaining',
+    'offenseTimeouts','defenseTimeouts',
+    'sp_rating_off','sp_offense_rating_off','sp_defense_rating_def','sp_rating_def',
+    'goal_to_go','fourth_and_short','fg_range','half','two_minute',
+    'passer_name'
+]
+ST2_FEATURES = ST1_FEATURES[:] + ['target_name']  # same shape; target_name optional for stage2 v2 if you add it
+
+def build_state_row(off: TeamContext, deff: TeamContext, down: int, distance: float,
+                    yards_to_goal: float, seconds_remaining: int,
+                    offense_timeouts: int, defense_timeouts: int,
+                    passer_name: str = "Unknown", target_name: str = "Unknown") -> pd.DataFrame:
+    row = {
+        'down': down,
+        'distance': float(distance),
+        'yardsToGoal': float(yards_to_goal),
+        'is_red_zone': red_zone(yards_to_goal),
+        'score_diff': 0,
+        'seconds_remaining': int(seconds_remaining),
+        'offenseTimeouts': int(offense_timeouts),
+        'defenseTimeouts': int(defense_timeouts),
+
+        # <<< SP+ mapping >>>
+        # offense team's numbers populate the "off" fields:
+        'sp_rating_off': off.sp_rating,                    # offense team's overall RATING
+        'sp_offense_rating_off': off.sp_offense,           # offense team's OFFENSE
+        # defense team's numbers populate the "def" fields:
+        'sp_defense_rating_def': deff.sp_defense,          # defense team's DEFENSE
+        'sp_rating_def': deff.sp_rating,                   # defense team's overall RATING
+
+        'goal_to_go': goal_to_go(distance, yards_to_goal),
+        'fourth_and_short': fourth_and_short(down, distance),
+        'fg_range': fg_range(yards_to_goal),
+        'half': 1 if seconds_remaining > 1800 else 2,
+        'two_minute': int(sec_in_half_left(seconds_remaining) <= 120),
+        'passer_name': str(passer_name),
+        'target_name': str(target_name),
+    }
+    return pd.DataFrame([row])
+
+
+# 1) PLAY-CALL POLICY (keep exactly like you have it)
+def pass_prob_v1(down, distance, yards_to_goal, seconds_remaining, score_diff):
+    base = 0.53  # was 0.48
+    if down == 1: base += 0.02 + 0.010 * max(0, distance - 10) / 10
+    if down == 2: base += 0.12 + 0.020 * max(0, distance - 7)  / 10
+    if down == 3: base += 0.28 + 0.030 * max(0, distance - 5)  / 10
+    if down == 4: base += 0.45 + 0.035 * max(0, distance - 3)  / 10
+    # red zone leans run a bit
+    if yards_to_goal <= 10: base -= 0.05
+    if yards_to_goal <=  5: base -= 0.03
+    # hurry-up pressure
+    two_min = (seconds_remaining % 1800) <= 120
+    if two_min and score_diff < 0:
+        base += 0.22
+    # trailing in last 10:00 of game
+    if seconds_remaining < 600 and score_diff < 0:
+        base += 0.06
+    return float(softclip(base, 0.10, 0.95))
+
+
+
+def pass_stage1_proba(dfrow: pd.DataFrame) -> float:
+    key = _pass_key(dfrow, with_target=False)
+    val = _PASS1_CACHE.get(key)
+    if val is not None:
+        return val
+    X = PASS1_META.transform(dfrow[ST1_FEATURES])
+    p = float(PASS1.inplace_predict(X)[0])
+    _PASS1_CACHE[key] = p
+    return p
+
+
+
+def pass_stage2_proba(dfrow: pd.DataFrame) -> Dict[str, float]:
+    key = _pass_key(dfrow, with_target=True)
+    val = _PASS2_CACHE.get(key)
+    if val is None:
+        # transform once, predict once
+        X = PASS2_PRE.transform(dfrow[ST2_FEATURES])
+        raw = PASS2.inplace_predict(X)[0]  # shape (nclass,)
+        out = {cls: float(p) for cls, p in zip(PASS2_CLASSES, raw)}
+        val = out
+        _PASS2_CACHE[key] = val
+
+    # copy + nudge + renorm (unchanged)
+    out = dict(val)
+    p_inc = max(0.0, out.get("incomplete", 0.0))
+    p_int = max(0.0, out.get("intercepted", 0.0))
+    p_sck = max(0.0, out.get("sack", 0.0))
+    p_sck *= 0.65
+    p_int = p_int * 1.20 + 0.004
+    s = p_inc + p_int + p_sck or 1.0
+    return {"incomplete": p_inc/s, "intercepted": p_int/s, "sack": p_sck/s}
+
+def _pass_yards_key(dfrow: pd.DataFrame) -> tuple:
+    # names usually not used by yardage models, but keep if they were
+    return _pass_key(dfrow, with_target=True)
+
+def _rush_yards_key(dfrow: pd.DataFrame) -> tuple:
+    # same key builder works; passer_name will be "Unknown"
+    return _pass_key(dfrow, with_target=False)
+
+def _get_pass_quants(dfrow):
+    k = _pass_yards_key(dfrow)
+    v = _PY_CACHE.get(k)
+    if v is None:
+        q10 = float(PY10.predict(dfrow)[0])
+        q50 = float(PY50.predict(dfrow)[0])
+        q90 = float(PY90.predict(dfrow)[0])
+        _PY_CACHE[k] = (q10, q50, q90)
+        v = _PY_CACHE[k]
+    return v
+
+def _get_rush_quants(dfrow):
+    k = _rush_yards_key(dfrow)
+    v = _RY_CACHE.get(k)
+    if v is None:
+        q10 = float(RY10.predict(dfrow)[0])
+        q50 = float(RY50.predict(dfrow)[0])
+        q90 = float(RY90.predict(dfrow)[0])
+        _RY_CACHE[k] = (q10, q50, q90)
+        v = _RY_CACHE[k]
+    return v
+
+def _get_sack_quants(dfrow):
+    # sacks key can reuse without target
+    k = _pass_key(dfrow, with_target=False)
+    v = _SY_CACHE.get(k)
+    if v is None:
+        q10 = float(SY10.predict(dfrow)[0])
+        q50 = float(SY50.predict(dfrow)[0])
+        q90 = float(SY90.predict(dfrow)[0])
+        _SY_CACHE[k] = (q10, q50, q90)
+        v = _SY_CACHE[k]
+    return v
+
+
+
+
+def sample_pass_yards(dfrow: pd.DataFrame) -> float:
+    q10, q50, q90 = _get_pass_quants(dfrow)
+    ytg = float(dfrow['yardsToGoal'].iloc[0])
+
+    # Slightly dampen when close to the GL (reduces short-field bombs)
+    if ytg < 15:
+        rz_scale = 0.8 + 0.2 * (ytg / 15.0)   # 0.8 at GL → 1.0 at 15
+        q10 *= rz_scale; q50 *= rz_scale; q90 *= rz_scale
+
+    sigma = max(0.4, (q90 - q10) / 2.56)
+    y = float(RNG.normal(q50, sigma))
+
+    # Taper long gains, then cap by field position
+    y = _taper(y, t1=22.0, t2=42.0, r1=0.60, r2=0.40)
+    return softclip(y, 0.0, ytg)
+
+
+def sample_rush_yards(dfrow: pd.DataFrame) -> float:
+    q10, q50, q90 = _get_rush_quants(dfrow)
+    ytg = float(dfrow['yardsToGoal'].iloc[0])
+
+    sigma = max(0.35, (q90 - q10) / 2.56)
+    y = float(RNG.normal(q50, sigma))
+
+    # Rush taper harsher on the extreme tail
+    y = _taper(y, t1=15.0, t2=30.0, r1=0.60, r2=0.35)
+    return softclip(y, -4.0, ytg)
+
+
+
+
+def sample_sack_loss(dfrow: pd.DataFrame) -> float:
+    q10, q50, q90 = _get_sack_quants(dfrow)
+    sigma = max(0.25, (q90 - q10) / 2.56)
+    y = float(RNG.normal(q50, sigma))
+    return float(softclip(y, -20.0, 0.0))
+
+
+# -----------------------------
+# Simple special teams v1
+# -----------------------------
+def field_goal_prob(distance_yd: float) -> float:
+    # very rough baseline curve
+    # 20-29: 0.95; 30-39: 0.90; 40-49: 0.75; 50-55: 0.45; >55: 0.2
+    if distance_yd < 30: return 0.96
+    if distance_yd < 40: return 0.92
+    if distance_yd < 50: return 0.78
+    if distance_yd <= 55: return 0.50
+    return 0.25
+
+def attempt_fg(yards_to_goal: float) -> Tuple[bool, int]:
+    # NCAA FG distance approx: yards_to_goal + 17 (end zone 10 + 7 snap)
+    dist = yards_to_goal + 17
+    p = field_goal_prob(dist)
+    good = RNG.random() < p
+    time = 12
+
+    return good, time
+
+def attempt_punt(yards_to_goal: float) -> Tuple[int, int]:
+    """
+    Returns (net_yards, time). Models touchbacks when punting near midfield.
+    """
+    # Base gross and return → net
+    gross = max(30.0, float(RNG.normal(43.0, 6.0)))        # gross distance
+    ret   = max(0.0, float(RNG.normal(6.0, 3.0)))          # return yards
+    net   = gross - ret
+
+    # If punting from near/inside opponent half, chance of touchback goes up
+    # ytg <= 60 means LOS is at opp 40 or closer.
+    if yards_to_goal <= 60:
+        tb_prob = softclip((60.0 - yards_to_goal) / 60.0, 0.10, 0.55)  # 10–55%
+        if RNG.random() < tb_prob:
+            # Choose a TB: set net so new offense starts at own 25 (ytg=75)
+            net = yards_to_goal - 25.0
+
+    # Clamp reasonable limits
+    net = float(softclip(net, 15.0, yards_to_goal - 1.0))
+    time = 8
+    return int(net), time
+
+
+# -----------------------------
+# Game state
+# -----------------------------
+
+@dataclass
+class GameState:
+    offense: TeamContext
+    defense: TeamContext
+    seconds_remaining: int = 60*60
+    down: int = 1
+    distance: float = 10.0
+    yards_to_goal: float = 75.0
+    offense_timeouts: int = 3
+    defense_timeouts: int = 3
+    period: int = 1
+    drive_id: int = 1
+    # team-keyed scores (do NOT swap on possession)
+    scores: Dict[str, int] = field(default_factory=dict)
+    # NEW flags
+    in_rz_this_drive: bool = False
+    going_for_it: bool = False
+
+    def init_scores(self):
+        if not self.scores:
+            self.scores = {self.offense.name: 0, self.defense.name: 0}
+
+
+
+def first_down_reset(gs: GameState, gained: float):
+    gs.down = 1
+    gs.distance = 10.0
+    gs.yards_to_goal = max(0.0, gs.yards_to_goal - gained)
+
+def advance_down(gs: GameState, gained: float):
+    gs.yards_to_goal = max(0.0, gs.yards_to_goal - gained)
+    if gained + 1e-6 >= gs.distance:  # first down
+        first_down_reset(gs, 0)
+    else:
+        gs.down += 1
+        gs.distance -= gained
+        if gs.down > 4:
+            # turnover on downs
+            change_possession(gs, reason="downs")
+
+def change_possession(gs: GameState, reason="normal", spot_overwrite: Optional[float] = None):
+    gs.offense, gs.defense = gs.defense, gs.offense
+    gs.down = 1
+    gs.distance = 10.0
+    gs.drive_id += 1
+    gs.in_rz_this_drive = False
+    gs.going_for_it = False
+    if spot_overwrite is not None:
+        gs.yards_to_goal = spot_overwrite
+    else:
+        gs.yards_to_goal = 100.0 - gs.yards_to_goal
+
+
+def tick_clock(gs: GameState, base: int):
+    gs.seconds_remaining = max(0, gs.seconds_remaining - base)
+    old_period = gs.period
+    # periods 1..4
+    gs.period = 4 - ((gs.seconds_remaining - 1) // 900) if gs.seconds_remaining > 0 else 4
+
+    if gs.period != old_period:
+        if gs.period == 3:
+            # reset timeouts
+            gs.offense_timeouts = 3
+            gs.defense_timeouts = 3
+            # halftime kickoff to the team that did NOT get the opening kickoff
+            change_possession(gs, reason="halftime", spot_overwrite=75.0)
+
+
+# -----------------------------
+# One play simulation
+# -----------------------------
+def simulate_play(gs: GameState, stats: Dict[str, dict], score: Dict[str, int], pstats: Dict[str, dict]) -> None:
+    if gs.seconds_remaining <= 0:
+        return
+
+    team = gs.offense.name
+    opp  = gs.defense.name
+    dist0 = gs.distance
+    ytg0  = gs.yards_to_goal
+    was_fourth_go = gs.going_for_it
+
+    # RZ trip detection (first time per drive)
+    if not gs.in_rz_this_drive and gs.yards_to_goal <= 20:
+        stats[team]["rz_trips"] += 1
+        gs.in_rz_this_drive = True
+
+    # policy
+    score_diff = score[team] - score[opp]
+    p_pass = pass_prob_v1(gs.down, gs.distance, gs.yards_to_goal, gs.seconds_remaining, score_diff)
+    call = sample_categorical(["run", "pass"], [1.0 - p_pass, p_pass])
+
+    stats[team]["plays"] += 1
+
+    # snapshot for 4th-down conversion & RZ-TD logic
+    dist0 = gs.distance
+    ytg0  = gs.yards_to_goal
+    was_fourth_go = gs.going_for_it  # set by handle_fourth when we "go"
+
+    if call == "pass":
+        qb = sample_qb(gs.offense)
+        wr = sample_target(gs.offense)
+
+        # Make sure players exist
+        _ensure_player(pstats, team, 'pass', qb)
+        _ensure_player(pstats, team, 'rec',  wr)
+
+        # Always credit a target on a called pass
+        pstats[team]['rec'][wr]['tgt'] += 1
+
+        # Build features
+        row = build_state_row(gs.offense, gs.defense, gs.down, gs.distance, gs.yards_to_goal,
+                              gs.seconds_remaining, gs.offense_timeouts, gs.defense_timeouts,
+                              passer_name=qb, target_name=wr)
+        row.loc[0, 'score_diff'] = score_diff
+
+        # Stage 1: completion prob + matchup tilt
+        p_complete = pass_stage1_proba(row)
+        p_complete = softclip(p_complete + matchup_bias(gs.offense, gs.defense), 0.02, 0.98)
+
+        if RNG.random() < p_complete:
+            # Completed pass
+            yards = sample_pass_yards(row) * yardage_multiplier(gs.offense, gs.defense)
+
+            # Optional red-zone finish boost
+            ytg0 = gs.yards_to_goal
+            if ytg0 <= 10 and RNG.random() < rz_finish_prob_pass(ytg0, gs.offense, gs.defense, gs.down):
+                yards = ytg0
+
+            # NCAA-style attempts (count only non-sack plays)
+            stats[team]["pass_att"] += 1
+            pstats[team]['pass'][qb]['att'] += 1
+
+            if yards + 1e-9 >= gs.yards_to_goal:
+                # TD pass
+                stats[team]["comp"] += 1
+                stats[team]["pass_yds"] += gs.yards_to_goal
+                stats[team]["pass_td"] += 1
+                score[team] += 7
+                stats[team]["points"] = score[team]
+
+                # QB and WR credit
+                pstats[team]['pass'][qb]['comp'] += 1
+                pstats[team]['pass'][qb]['yds']  += gs.yards_to_goal
+                pstats[team]['pass'][qb]['td']   += 1
+
+                pstats[team]['rec'][wr]['rec']  += 1
+                pstats[team]['rec'][wr]['yds']  += gs.yards_to_goal
+                pstats[team]['rec'][wr]['td']   += 1
+
+                if was_fourth_go:
+                    stats[team]["fourth_conv"] += 1
+                gs.going_for_it = False
+                tick_clock(gs, 20)
+                change_possession(gs, reason="kickoff", spot_overwrite=75.0)
+                return
+            else:
+                # Gain but not a TD
+                stats[team]["comp"] += 1
+                stats[team]["pass_yds"] += yards
+
+                pstats[team]['pass'][qb]['comp'] += 1
+                pstats[team]['pass'][qb]['yds']  += yards
+
+                pstats[team]['rec'][wr]['rec']  += 1
+                pstats[team]['rec'][wr]['yds']  += yards
+
+                if was_fourth_go and (yards + 1e-6 >= dist0):
+                    stats[team]["fourth_conv"] += 1
+                gs.going_for_it = False
+                advance_down(gs, yards)
+                tick_clock(gs, 29)
+                return
+
+        else:
+            # Stage 2: sack / INT / incomplete
+            p2 = pass_stage2_proba(row)
+            outcome = sample_categorical(["incomplete","intercepted","sack"],
+                                         [p2["incomplete"], p2["intercepted"], p2["sack"]])
+
+            if outcome == "incomplete":
+                # Count an attempt, no completion
+                stats[team]["pass_att"] += 1
+                pstats[team]['pass'][qb]['att'] += 1
+                gs.down += 1
+                gs.going_for_it = False
+                tick_clock(gs, 12)
+                return
+
+            elif outcome == "sack":
+                # Sacks do NOT count as attempts by default
+                stats[team]["sacks"] += 1
+                pstats[team]['pass'][qb]['sacks'] += 1
+
+                loss = -sample_sack_loss(row)
+                loss = max(0.0, loss)
+                loss = min(loss, 100 - (100 - gs.yards_to_goal))
+                gs.yards_to_goal += loss
+                gs.distance += loss
+                gs.down += 1
+                gs.going_for_it = False
+                tick_clock(gs, 28)
+                return
+
+            else:  # intercepted
+                # Count an attempt + INT
+                stats[team]["pass_att"] += 1
+                pstats[team]['pass'][qb]['att'] += 1
+
+                stats[team]["INT"] += 1
+                pstats[team]['pass'][qb]['INT'] += 1
+
+                ret = float(softclip(RNG.normal(6, 5), 0, gs.yards_to_goal))
+                new_ytg_for_new_offense = 100.0 - (gs.yards_to_goal - ret)
+                gs.going_for_it = False
+                change_possession(gs, reason="INT", spot_overwrite=new_ytg_for_new_offense)
+                tick_clock(gs, 12)
+                return
+
+    else:  # run
+
+        rb = sample_rusher(gs.offense)
+        _ensure_player(pstats, team, 'rush', rb)
+        stats[team]["rush_att"] += 1
+        pstats[team]['rush'][rb]['att'] += 1
+
+        row = build_state_row(gs.offense, gs.defense, gs.down, gs.distance, gs.yards_to_goal,
+                              gs.seconds_remaining, gs.offense_timeouts, gs.defense_timeouts,
+                              passer_name="Unknown")
+        row.loc[0, 'score_diff'] = score_diff
+        row['rusher_name'] = rb
+
+        yards = sample_rush_yards(row) * yardage_multiplier(gs.offense, gs.defense)
+        # occasional explosive on runs
+        if ytg0 > 25 and RNG.random() < 0.5 * explosive_prob(gs.offense, gs.defense, ytg0):
+            yards *= 1.0 + RNG.uniform(0.2, 0.5) * (1.0 + 0.6 * mismatch_z(gs.offense, gs.defense))
+            yards = min(yards, ytg0)
+        # finish-in-RZ hook
+        if ytg0 <= 7 and gs.down <= 3:
+            if RNG.random() < rz_finish_prob_run(ytg0, gs.offense, gs.defense, gs.down):
+                yards = ytg0
+
+        if yards + 1e-9 >= ytg0:
+            stats[team]["rush_yds"] += ytg0
+            pstats[team]['rush'][rb]['yds'] += gs.yards_to_goal
+            stats[team]["rush_td"] += 1
+            pstats[team]['rush'][rb]['td']  += 1
+            if ytg0 <= 20: stats[team]["rz_TD"] += 1
+            score[team] += 7
+            stats[team]["points"] = score[team]
+            tick_clock(gs, T_RUN)
+            change_possession(gs, reason="kickoff", spot_overwrite=75.0)
+            if was_fourth_go: stats[team]["fourth_conv"] += 1
+            gs.going_for_it = False
+            return
+        else:
+            stats[team]["rush_yds"] += yards
+            pstats[team]['rush'][rb]['yds'] += yards
+            if was_fourth_go and (yards + 1e-6 >= dist0):
+                stats[team]["fourth_conv"] += 1
+            advance_down(gs, yards)
+            tick_clock(gs, T_RUN)
+            if not gs.in_rz_this_drive and gs.yards_to_goal <= 20:
+                stats[team]["rz_trips"] += 1
+                gs.in_rz_this_drive = True
+            gs.going_for_it = False
+            return
+        
+PLAYER_COLS = [
+    "sim","start","team","opp","player","role",
+    "pass_att","pass_comp","pass_yds","pass_td","INT","sacks",
+    "rush_att","rush_yds","rush_td",
+    "rec","tgt","rec_yds","rec_td"
+]
+
+def flatten_player_box(result: dict, sim_id: int, start_flag: str = "") -> pd.DataFrame:
+    teams = list(result["box"].keys())
+    opp = {teams[0]: teams[1], teams[1]: teams[0]}
+    rows = []
+    pb = result["players"]
+    for team in teams:
+        # QB/pass
+        for name, s in pb[team]['pass'].items():
+            rows.append(dict(
+                sim=sim_id, start=start_flag, team=team, opp=opp[team], player=name, role="QB",
+                pass_att=s['att'], pass_comp=s['comp'], pass_yds=round(s['yds'],1),
+                pass_td=s['td'], INT=s['INT'], sacks=s['sacks'],
+                rush_att=0, rush_yds=0.0, rush_td=0, rec=0, tgt=0, rec_yds=0.0, rec_td=0
+            ))
+        # Rushing
+        for name, s in pb[team]['rush'].items():
+            rows.append(dict(
+                sim=sim_id, start=start_flag, team=team, opp=opp[team], player=name, role="Rusher",
+                pass_att=0, pass_comp=0, pass_yds=0.0, pass_td=0, INT=0, sacks=0,
+                rush_att=s['att'], rush_yds=round(s['yds'],1), rush_td=s['td'],
+                rec=0, tgt=0, rec_yds=0.0, rec_td=0
+            ))
+        # Receiving
+        for name, s in pb[team]['rec'].items():
+            rows.append(dict(
+                sim=sim_id, start=start_flag, team=team, opp=opp[team], player=name, role="Receiver",
+                pass_att=0, pass_comp=0, pass_yds=0.0, pass_td=0, INT=0, sacks=0,
+                rush_att=0, rush_yds=0.0, rush_td=0,
+                rec=s['rec'], tgt=s['tgt'], rec_yds=round(s['yds'],1), rec_td=s['td']
+            ))
+    return pd.DataFrame(rows)
+
+
+# -----------------------------
+# 4th down decision + special teams
+# -----------------------------
+
+def go_for_it_prob(ytg: float, dist: float, score_diff: int, seconds_remaining: int) -> float:
+    """
+    Probability to go on 4th given yards_to_goal (ytg), distance to gain (dist),
+    score context, and clock. Returns a number in [0,1].
+    """
+    # Late game aggression if trailing and < 5 minutes
+    if seconds_remaining < 300 and (score_diff < 0):
+        # If a FG doesn't tie or take the lead, be very aggressive
+        return 0.90 if (ytg > 38) else 0.75
+
+    p = 0.0
+    # Buckets by field position (ytg = distance to opponent end zone; smaller = deeper)
+    if ytg > 80:            # own 20 or worse
+        if dist <= 1:  p = 0.15
+        elif dist <= 2: p = 0.05
+    elif ytg > 65:          # own 20–35
+        if dist <= 1:  p = 0.30
+        elif dist <= 2: p = 0.15
+    elif ytg > 50:          # own 35–midfield
+        if dist <= 1:  p = 0.60
+        elif dist <= 2: p = 0.40
+        elif dist <= 3: p = 0.20
+    elif ytg > 35:          # midfield to opp 35 (no-man’s land)
+        if dist <= 1:  p = 0.85
+        elif dist <= 2: p = 0.65
+        elif dist <= 3: p = 0.40
+        elif dist <= 4: p = 0.25
+    elif ytg > 20:          # opp 35–20 (fringe FG)
+        if dist <= 1:  p = 0.75
+        elif dist <= 2: p = 0.50
+        elif dist <= 3: p = 0.30
+    elif ytg > 10:          # red zone (20–10)
+        if dist <= 1:  p = 0.70
+        elif dist <= 2: p = 0.45
+    else:                   # goal-to-go (≤ 10)
+        if dist <= 2:  p = 0.85
+        elif dist <= 4: p = 0.40
+
+    # Slight tilt if leading late: be a bit more conservative
+    if seconds_remaining < 300 and score_diff > 0:
+        p *= 0.85
+
+    return float(softclip(p, 0.0, 1.0))
+
+
+
+def handle_fourth(gs: GameState, stats: Dict[str, dict], score: Dict[str, int]) -> bool:
+    """Return True if a special-teams play ended the drive; False if we run a normal play (go for it)."""
+    if gs.down != 4:
+        return False
+
+    team = gs.offense.name
+    opp  = gs.defense.name
+    ytg  = float(gs.yards_to_goal)
+    dist = float(gs.distance)
+    score_diff = score[team] - score[opp]
+
+    # 1) Decide whether to go
+    p_go = min(1.0, go_for_it_prob(ytg, dist, score_diff, gs.seconds_remaining) * 1.15)
+    if RNG.random() < p_go:
+            gs.going_for_it = True
+            stats[team]["fourth_go"] += 1
+            return False  # go for it → run normal play
+
+    # 2) If not going, consider FG (≤ ~55-yard attempt → ytg <= 38)
+    if ytg <= 38:
+        stats[team]["FGA"] += 1
+        good, t = attempt_fg(ytg)
+        tick_clock(gs, T_FG)
+        if good:
+            stats[team]["FG"] += 1
+            score[team] += 3
+            stats[team]["points"] = score[team]
+            change_possession(gs, reason="kickoff", spot_overwrite=75.0)
+        else:
+            # Miss: opponent takes over at previous LOS
+            change_possession(gs, reason="fg_miss", spot_overwrite=100.0 - ytg)
+        return True
+
+    # 3) Otherwise punt
+    stats[team]["punts"] += 1
+    net, t = attempt_punt(ytg)
+    tick_clock(gs, T_PUNT)
+    new_ytg_for_new_offense = softclip(100.0 - (ytg - net), 1, 99)
+    change_possession(gs, reason="punt", spot_overwrite=new_ytg_for_new_offense)
+    return True
+
+
+
+# -----------------------------
+# Full game simulation
+# -----------------------------
+def simulate_game(team_off: TeamContext, team_def: TeamContext, seed: Optional[int] = None) -> Dict:
+    if seed is not None:
+        global RNG
+        RNG = np.random.default_rng(seed)
+
+    gs = GameState(offense=team_off, defense=team_def)
+    # team-scoped stats and points
+    stats = {team_off.name: new_team_stats(), team_def.name: new_team_stats()}
+    score = {team_off.name: 0, team_def.name: 0}
+        # per-player stats
+    pstats = {
+        team_off.name: {'pass':{}, 'rush':{}, 'rec':{}},
+        team_def.name: {'pass':{}, 'rush':{}, 'rec':{}}
+    }
+
+
+    # Start at own 25 after opening KO
+    gs.yards_to_goal = 75.0
+
+    while gs.seconds_remaining > 0:
+        # handle 4th-down special teams (needs team-scoped stats)
+        if handle_fourth(gs, stats, score):
+            continue
+        simulate_play(gs, stats, score, pstats)
+    # stats[team_off.name]["points"] = score[team_off.name]
+    # stats[team_def.name]["points"] = score[team_def.name]
+
+    # Build a backward-compatible return plus a boxscore
+    return {
+        "offense": team_off.name, "defense": team_def.name,
+        "off_score": score[team_off.name], "def_score": score[team_def.name],
+        "box": {
+            team_off.name: stats[team_off.name],
+            team_def.name: stats[team_def.name],
+        },
+        "players": pstats
+    }
+
+
+def simulate_matchup(teamA: TeamContext, teamB: TeamContext, n: int = 100,
+                     seed: int | None = None, show_progress: bool = True,
+                     collect_players: bool = False,
+                     players_csv: Optional[str] = None
+                     ) -> Tuple[pd.DataFrame, pd.DataFrame | None]:
+    rows = []
+    iterator = range(n)
+    if show_progress and tqdm is not None:
+        iterator = tqdm(iterator, desc=f"{teamA.name} vs {teamB.name} sims", unit="game")
+
+    player_rows = [] if collect_players else None
+
+    for i in iterator:
+        r1 = simulate_game(teamA, teamB, seed=seed)   # keep seed=None for true randomness
+        r2 = simulate_game(teamB, teamA, seed=seed)
+        rows.append({"team": r1["offense"], "opp": r1["defense"], "pts": r1["off_score"], "opp_pts": r1["def_score"]})
+        rows.append({"team": r2["offense"], "opp": r2["defense"], "pts": r2["off_score"], "opp_pts": r2["def_score"]})
+        if collect_players:
+            player_rows.append(flatten_player_box(r1, sim_id=2*i,   start_flag="A"))
+            player_rows.append(flatten_player_box(r2, sim_id=2*i+1, start_flag="B"))
+
+    sims_df = pd.DataFrame(rows)
+
+    players_df = None
+    if collect_players:
+        players_df = pd.concat(player_rows, ignore_index=True) if player_rows else pd.DataFrame(columns=PLAYER_COLS)
+        if players_csv:
+            players_df.to_csv(players_csv, index=False)
+
+    return sims_df, players_df
+
+
+def print_boxscore(result):
+    box = result["box"]
+    a, b = list(box.keys())
+
+    def line(team):
+        s = box[team]
+        pts = int(s.get("points", 0))
+
+        att = int(s.get("pass_att", 0))
+        comp = int(s.get("comp", 0))
+        pass_yds = float(s.get("pass_yds", 0.0))
+        pass_td = int(s.get("pass_td", 0))
+        itc = int(s.get("INT", 0))
+        sacks = int(s.get("sacks", 0))
+
+        rush_att = int(s.get("rush_att", 0))
+        rush_yds = float(s.get("rush_yds", 0.0))
+        rush_td = int(s.get("rush_td", 0))
+
+        fg = int(s.get("FG", 0))
+        fga = int(s.get("FGA", 0))
+        punts = int(s.get("punts", 0))
+
+        rz_trips = int(s.get("rz_trips", 0))
+        rz_td = int(s.get("rz_TD", 0))
+        fourth_go = int(s.get("fourth_go", 0))
+        fourth_conv = int(s.get("fourth_conv", 0))
+
+        cmp_pct = (100.0 * comp / att) if att else 0.0
+        ypa = (pass_yds / att) if att else 0.0
+        ypc = (rush_yds / rush_att) if rush_att else 0.0
+
+        print(
+            f"{team}: {pts} pts | "
+            f"Pass {comp}/{att} ({cmp_pct:.0f}%) for {pass_yds:.1f} yds (YPA {ypa:.1f}), "
+            f"TD {pass_td}, INT {itc}, Sacks {sacks} | "
+            f"Rush {rush_att} for {rush_yds:.1f} yds (YPC {ypc:.1f}), TD {rush_td} | "
+            f"FG {fg}/{fga}, Punts {punts} | "
+            f"RZ {rz_td}/{rz_trips} TD | 4th {fourth_conv}/{fourth_go}"
+        )
+
+    for team in (a, b):
+        line(team)
+
+
+# ---------- New: SP+ table helpers for upcoming games ----------
+_SP_CACHE_MAP_FLEX: Dict[str, pd.DataFrame] = {}
+
+def _norm_team(s: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '', str(s).lower())
+
+def load_sp_flex(sp_path: str) -> pd.DataFrame:
+    """
+    Load an SP+ table and normalize to columns: team, RATING, OFFENSE, DEFENSE.
+    Supports:
+      (A) team,RATING,OFFENSE,DEFENSE,year,week,...
+      (B) 'Current SP+' | 'Past SP+' (team names) + 'Rating','Offense Rating','Defense Rating'
+    Caches by path.
+    """
+    global _SP_CACHE_MAP_FLEX
+    if sp_path in _SP_CACHE_MAP_FLEX:
+        return _SP_CACHE_MAP_FLEX[sp_path]
+
+    raw = pd.read_csv(sp_path)
+
+    # Schema A: already in team / RATING / OFFENSE / DEFENSE
+    if {'team','RATING','OFFENSE','DEFENSE'}.issubset(raw.columns):
+        sp = raw[['team','RATING','OFFENSE','DEFENSE']].copy()
+        sp['team'] = sp['team'].astype(str).str.strip()
+        sp['RATING'] = sp['RATING'].astype(float)
+        sp['OFFENSE'] = sp['OFFENSE'].astype(float)
+        sp['DEFENSE'] = sp['DEFENSE'].astype(float)
+    # Schema B: your 2025 file
+    elif {'Current SP+','Past SP+','Rating','Offense Rating','Defense Rating'}.issubset(raw.columns):
+        a = raw[['Current SP+','Rating','Offense Rating','Defense Rating']].rename(
+            columns={'Current SP+':'team','Rating':'RATING','Offense Rating':'OFFENSE','Defense Rating':'DEFENSE'}
+        )
+        b = raw[['Past SP+','Rating','Offense Rating','Defense Rating']].rename(
+            columns={'Past SP+':'team','Rating':'RATING','Offense Rating':'OFFENSE','Defense Rating':'DEFENSE'}
+        )
+        sp = pd.concat([a, b], ignore_index=True)
+        sp = sp.dropna(subset=['team']).copy()
+        sp['team'] = sp['team'].astype(str).str.strip()
+        # If a team appears in both columns with same numbers, keep first
+        sp = sp.drop_duplicates(subset=['team'], keep='first')
+        sp['RATING'] = sp['RATING'].astype(float)
+        sp['OFFENSE'] = sp['OFFENSE'].astype(float)
+        sp['DEFENSE'] = sp['DEFENSE'].astype(float)
+    else:
+        raise ValueError(
+            f"Unrecognized SP+ schema in {sp_path}. "
+            f"Expected columns either "
+            f"[team,RATING,OFFENSE,DEFENSE,...] or "
+            f"['Current SP+','Past SP+','Rating','Offense Rating','Defense Rating']"
+        )
+
+    sp['norm_team'] = sp['team'].map(_norm_team)
+    _SP_CACHE_MAP_FLEX[sp_path] = sp
+    return sp
+
+def lookup_sp_flex(team: str, sp_df: pd.DataFrame) -> Tuple[float, float, float]:
+    """
+    Case-insensitive and punctuation-insensitive lookup in normalized 'team'.
+    Returns (RATING, OFFENSE, DEFENSE).
+    """
+    norm = _norm_team(team)
+    hit = sp_df[sp_df['norm_team'] == norm]
+    if hit.empty:
+        # try simple lowercase exact as a fallback
+        hit = sp_df[sp_df['team'].str.lower() == team.lower()]
+    if hit.empty:
+        # final loose fallback: substring contains (guarded)
+        cand = sp_df[sp_df['team'].str.lower().str.contains(team.lower(), regex=False)]
+        if not cand.empty:
+            hit = cand.iloc[:1]
+    if hit.empty:
+        raise ValueError(f"Team '{team}' not found in provided SP+ table.")
+
+    row = hit.iloc[0]
+    return float(row['RATING']), float(row['OFFENSE']), float(row['DEFENSE'])
+
+def build_team_context_from_sp_flex(team: str, year: int, week: int, sp_df: pd.DataFrame) -> TeamContext:
+    rating, off, deff = lookup_sp_flex(team, sp_df)
+    qb = _load_usage_table("usage_qb_share.csv", team, year, "passer_name")
+    ru = _load_usage_table("usage_rush_share.csv", team, year, "rusher_name")
+    tg = _load_usage_table("usage_target_share.csv", team, year, "receiver_name")
+    if qb is None: qb = pd.DataFrame({"passer_name": ["Unknown"], "share": [1.0]})
+    if ru is None: ru = pd.DataFrame({"rusher_name": ["Unknown"], "share": [1.0]})
+    if tg is None: tg = pd.DataFrame({"receiver_name": ["Unknown"], "share": [1.0]})
+    return TeamContext(
+        name=team, year=year, week=week,
+        sp_rating=rating, sp_offense=off, sp_defense=deff,
+        qb_share=qb, rush_share=ru, target_share=tg
+    )
+
+def simulate_upcoming_matchup(teamA: str, teamB: str, *,
+                              year: int = 2025, week: int = 1,
+                              sp_path: str = "Pregame_SPPlus2025_1.csv",
+                              n: int = 1000,          # keep random: do NOT pass a seed
+                              show_progress: bool = True,
+                              collect_players: bool = True,
+                              save_csv: Optional[str] = None):
+    sp_df = load_sp_flex(sp_path)
+    A = build_team_context_from_sp_flex(teamA, year, week, sp_df)
+    B = build_team_context_from_sp_flex(teamB, year, week, sp_df)
+
+    sims_df, players_df = simulate_matchup(
+        A, B, n=n, seed=None, show_progress=show_progress,
+        collect_players=collect_players
+    )
+
+    summary = sims_df.groupby("team").agg(
+        mean_pts=("pts", "mean"),
+        sd_pts=("pts", "std"),
+        mean_opp=("opp_pts", "mean"),
+        sd_opp=("opp_pts", "std"),
+        win_rate=("pts", lambda s: (s.values > sims_df.loc[s.index, "opp_pts"].values).mean()),
+    )
+
+    if save_csv:
+        sims_df.to_csv(f"scores_{save_csv}", index=False)
+        if players_df is not None:
+            players_df.to_csv(f"players_{save_csv}", index=False)
+
+    return sims_df, players_df, summary, A, B
+
+
+if __name__ == "__main__":
+    sims_df, players_df, summary, KSU, ISU = simulate_upcoming_matchup(
+        "Kansas State", "Iowa State",
+        year=2025, week=1,
+        sp_path="PregameSPPlus2025_1.csv",
+        n=10, show_progress=True,
+        collect_players=True,                 # <— IMPORTANT
+        save_csv="ksu_isu_wk1_sims.csv"
+    )
+
+    print(summary.round(2))
+    print("\nSample 5 rows:")
+    print(sims_df.sample(5, random_state=42).round(1))
+
+    if players_df is not None and not players_df.empty:
+        print("\nSample 5 player rows:")
+        print(players_df.sample(5, random_state=42).round(1))
+
+
+
+
+
+
